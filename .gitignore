@@ -1,0 +1,20 @@
+# Arduino temporary files
+*.tmp
+*.bak
+*.swp
+*.bin
+*.elf
+*.hex
+*.eep
+*.lss
+
+# OS / editor files
+.DS_Store
+Thumbs.db
+*.swp
+
+# Arduino IDE build folders
+build/
+# Secrets files anywhere
+**/secrets.h
+
