@@ -12,19 +12,35 @@
 #define LOG_FILE "/system.log"
 #define LOG_MAX_LINES 5000
 #define SENSOR_INTERVAL_MS 15000
-#define PRUNE_CHECK_INTERVAL 3600000  // Check log size once per hour
+#define PRUNE_CHECK_INTERVAL 3600000
 #define MAX_UPLOAD_RETRIES 3
-#define SENSOR_WARMUP_READINGS 5      // Discard first N gas readings
+#define SENSOR_WARMUP_READINGS 5
+
+// SparkFun Weather Meter Kit specifications
+#define WIND_FACTOR 2.4         // km/h per pulse per second (1.492 MPH = 2.4 km/h)
+#define RAIN_PER_TIP 0.2794     // mm per tip (0.011" = 0.2794mm)
+#define DEBOUNCE_MS 10          // Debounce time for switches
 
 // ----------------- Adafruit IO -----------------
 AdafruitIO_WiFi io(IO_USERNAME, IO_KEY, WIFI_SSID, WIFI_PASS);
 Adafruit_BME680 bme;
 
-// Feeds for dashboard
+// Feeds
 AdafruitIO_Feed *temperature = io.feed("Temperature");
 AdafruitIO_Feed *humidity    = io.feed("Humidity");
 AdafruitIO_Feed *pressure    = io.feed("Pressure");
 AdafruitIO_Feed *gas         = io.feed("Gas");
+AdafruitIO_Feed *windSpeed   = io.feed("WindSpeed");
+AdafruitIO_Feed *rainGauge   = io.feed("RainGauge");
+AdafruitIO_Feed *windDir     = io.feed("WindDirection");
+AdafruitIO_Feed *windDirText = io.feed("WindDirectionText");
+
+
+// Wind direction data structure
+struct WindDirData {
+  float degrees;
+  const char* direction;
+};
 
 // ----------------- State variables -----------------
 bool sdCardAvailable = false;
@@ -35,6 +51,93 @@ int gasWarmupCounter = 0;
 
 // Latest sensor values
 float t = 0, h = 0, p = 0, g = 0;
+float wind_kmh = 0, rain_mm = 0, wind_deg = 0;
+String wind_direction = "N";
+
+// ----------------- Wind & Rain Pins -----------------
+const int windPin = 4;
+const int rainPin = 27;
+const int windDirPin = 34;
+
+volatile unsigned long windCount = 0;
+volatile unsigned long rainCount = 0;
+volatile unsigned long lastWindTime = 0;
+volatile unsigned long lastRainTime = 0;
+
+// Interrupt handlers with debouncing
+void IRAM_ATTR onWind() {
+  unsigned long now = millis();
+  if (now - lastWindTime > DEBOUNCE_MS) {
+    windCount++;
+    lastWindTime = now;
+  }
+}
+
+void IRAM_ATTR onRain() {
+  unsigned long now = millis();
+  if (now - lastRainTime > DEBOUNCE_MS) {
+    rainCount++;
+    lastRainTime = now;
+  }
+}
+
+
+// Wind direction lookup table for SparkFun Weather Meter Kit
+// Based on resistor network values (16 positions)
+// Reference voltage divider creates these ADC values at 3.3V
+WindDirData getWindDirection(int analogValue) {
+  // Lookup table: ADC value ranges -> degrees & cardinal direction
+  struct WindEntry {
+    int adcMin;
+    int adcMax;
+    float degrees;
+    const char* direction;
+  };
+  
+  // 16-position wind vane ADC ranges (for 3.3V reference, 12-bit ADC)
+  WindEntry directions[] = {
+    {3143, 3243, 0.0, "N"},
+    {1624, 1724, 22.5, "NNE"},
+    {1845, 1945, 45.0, "NE"},
+    {335, 435, 67.5, "ENE"},
+    {372, 472, 90.0, "E"},
+    {264, 364, 112.5, "ESE"},
+    {738, 838, 135.0, "SE"},
+    {506, 606, 157.5, "SSE"},
+    {1149, 1249, 180.0, "S"},
+    {979, 1079, 202.5, "SSW"},
+    {2030, 2130, 225.0, "SW"},
+    {1493, 1593, 247.5, "WSW"},
+    {3780, 3880, 270.0, "W"},
+    {3309, 3409, 292.5, "WNW"},
+    {3548, 3648, 315.0, "NW"},
+    {2815, 2915, 337.5, "NNW"}
+  };
+  
+  // Find matching direction
+  for (int i = 0; i < 16; i++) {
+    if (analogValue >= directions[i].adcMin && analogValue <= directions[i].adcMax) {
+      WindDirData result = {directions[i].degrees, directions[i].direction};
+      return result;
+    }
+  }
+  
+  // If no exact match, find closest
+  int closestIdx = 0;
+  int minDiff = abs(analogValue - (directions[0].adcMin + directions[0].adcMax) / 2);
+  
+  for (int i = 1; i < 16; i++) {
+    int centerValue = (directions[i].adcMin + directions[i].adcMax) / 2;
+    int diff = abs(analogValue - centerValue);
+    if (diff < minDiff) {
+      minDiff = diff;
+      closestIdx = i;
+    }
+  }
+  
+  WindDirData result = {directions[closestIdx].degrees, directions[closestIdx].direction};
+  return result;
+}
 
 // ----------------- Logging helper -----------------
 void logMessage(const char *msg) {
@@ -52,7 +155,6 @@ void logMessage(const char *msg) {
 
   snprintf(fullMsg, sizeof(fullMsg), "%s %s", prefix, msg);
 
-  // Write to SD card if available
   if (sdCardAvailable) {
     File logFile = SD.open(LOG_FILE, FILE_APPEND);
     if (logFile) {
@@ -64,11 +166,10 @@ void logMessage(const char *msg) {
     }
   }
 
-  // Always write to serial
   Serial.println(fullMsg);
 }
 
-// Improved log pruning - only checks periodically
+// Log pruning function
 void pruneLog() {
   if (!sdCardAvailable) return;
   if (millis() - lastPruneCheck < PRUNE_CHECK_INTERVAL) return;
@@ -78,7 +179,6 @@ void pruneLog() {
   File file = SD.open(LOG_FILE, FILE_READ);
   if (!file) return;
 
-  // Count lines efficiently
   int lineCount = 0;
   while (file.available()) {
     if (file.read() == '\n') lineCount++;
@@ -90,7 +190,6 @@ void pruneLog() {
     return;
   }
 
-  // Keep last 60% of lines to avoid frequent pruning
   int linesToKeep = (LOG_MAX_LINES * 6) / 10;
   int linesToSkip = lineCount - linesToKeep;
 
@@ -100,17 +199,15 @@ void pruneLog() {
   if (!src || !tmp) {
     if (src) src.close();
     if (tmp) tmp.close();
-    logMessage("Log pruning failed - file error");
+    logMessage("Log pruning failed");
     return;
   }
 
-  // Skip lines efficiently
   int currentLine = 0;
   while (src.available() && currentLine < linesToSkip) {
     if (src.read() == '\n') currentLine++;
   }
 
-  // Copy remaining lines
   while (src.available()) {
     tmp.write(src.read());
   }
@@ -144,12 +241,12 @@ bool initSensor() {
       bme.setIIRFilterSize(BME680_FILTER_SIZE_3);
       bme.setGasHeater(320, 150);
       
-      logMessage("BME680 sensor initialized successfully");
+      logMessage("BME680 sensor initialized");
       return true;
     }
     delay(1000);
   }
-  logMessage("BME680 initialization failed after 3 attempts");
+  logMessage("BME680 initialization failed");
   return false;
 }
 
@@ -157,7 +254,7 @@ bool initSensor() {
 bool uploadToAdafruitIO() {
   for (int attempt = 0; attempt < MAX_UPLOAD_RETRIES; attempt++) {
     if (io.status() < AIO_CONNECTED) {
-      logMessage("Adafruit IO disconnected - attempting reconnection");
+      logMessage("Reconnecting to Adafruit IO");
       io.connect();
       delay(2000);
       continue;
@@ -168,9 +265,13 @@ bool uploadToAdafruitIO() {
     success &= humidity->save(h);
     success &= pressure->save(p);
     success &= gas->save(g);
+    success &= windSpeed->save(wind_kmh);
+    success &= rainGauge->save(rain_mm);
+    success &= windDir->save(wind_deg);
+    success &= windDirText->save(wind_direction);
 
     if (success) {
-      logMessage("Uploaded readings to Adafruit IO");
+      logMessage("Uploaded all readings to Adafruit IO");
       return true;
     }
     
@@ -185,15 +286,15 @@ bool uploadToAdafruitIO() {
 void setup() {
   Serial.begin(115200);
   delay(100);
-  Serial.println("\n=== Weather Station Booting ===");
+  Serial.println("\n=== Weather Station with SparkFun Meter Kit ===");
 
   // Initialize SD card
   Serial.println("Initializing SD card...");
   if (SD.begin(SD_CS)) {
     sdCardAvailable = true;
-    logMessage("SD card initialized successfully");
+    logMessage("SD card initialized");
   } else {
-    Serial.println("SD card initialization failed - continuing without SD logging");
+    Serial.println("SD card failed - continuing without logging");
   }
 
   // Connect to Adafruit IO
@@ -211,85 +312,119 @@ void setup() {
     Serial.println("\nConnected to Adafruit IO!");
     logMessage("Connected to Adafruit IO");
     
-    // Configure NTP for accurate timestamps
     configTime(0, 0, "pool.ntp.org", "time.nist.gov");
     logMessage("NTP time sync configured");
   } else {
-    Serial.println("\nFailed to connect to Adafruit IO - will retry in loop");
-    logMessage("Initial Adafruit IO connection failed");
+    Serial.println("\nFailed to connect - will retry in loop");
+    logMessage("Initial connection failed");
   }
 
-  // Initialize BME680 sensor
+  // Initialize BME680
   sensorAvailable = initSensor();
-  
   if (!sensorAvailable) {
-    logMessage("WARN: Starting without sensor - will retry");
+    logMessage("WARN: Starting without BME680 - will retry");
   }
+
+  // Setup wind sensor (anemometer)
+  pinMode(windPin, INPUT_PULLUP);
+  attachInterrupt(digitalPinToInterrupt(windPin), onWind, FALLING);
+  logMessage("Anemometer initialized (pin 4)");
+
+  // Setup rain gauge
+  pinMode(rainPin, INPUT_PULLUP);
+  attachInterrupt(digitalPinToInterrupt(rainPin), onRain, FALLING);
+  logMessage("Rain gauge initialized (pin 27)");
+
+  // Setup wind vane (analog direction sensor)
+  pinMode(windDirPin, INPUT);
+  logMessage("Wind vane initialized (pin 34)");
 
   if (sdCardAvailable) {
     pruneLog();
   }
   
   logMessage("=== System startup complete ===");
+  logMessage("Wind speed in km/h, Rain in mm");
 }
 
 // ----------------- Main loop -----------------
 void loop() {
-  io.run(); // Maintain Adafruit IO connection - call frequently
+  io.run();
   
   unsigned long now = millis();
 
-  // --- Sensor reading & upload every 15 seconds ---
   if (now - lastSensorTime >= SENSOR_INTERVAL_MS) {
     lastSensorTime = now;
 
-    // Retry sensor initialization if it failed
+    // Retry sensor if needed
     if (!sensorAvailable) {
       sensorAvailable = initSensor();
       if (!sensorAvailable) return;
     }
 
-    // Perform sensor reading
+    // Read BME680
     if (!bme.performReading()) {
-      logMessage("Sensor reading failed - will retry next cycle");
+      logMessage("Sensor read failed");
       sensorAvailable = false;
       return;
     }
 
-    // Get readings
     t = bme.temperature;
     h = bme.humidity;
     p = bme.pressure / 100.0;
     g = bme.gas_resistance / 1000.0;
 
-    // Validate readings
+    // Validate BME680 readings
     if (!validateReading(t, h, p, g)) {
-      logMessage("Invalid sensor readings detected - skipping");
+      logMessage("Invalid sensor readings - skipping");
       return;
     }
 
-    // Discard initial gas readings during warmup
     if (gasWarmupCounter < SENSOR_WARMUP_READINGS) {
       gasWarmupCounter++;
       char msg[64];
-      snprintf(msg, sizeof(msg), "Gas sensor warmup %d/%d", gasWarmupCounter, SENSOR_WARMUP_READINGS);
+      snprintf(msg, sizeof(msg), "Gas warmup %d/%d", gasWarmupCounter, SENSOR_WARMUP_READINGS);
       logMessage(msg);
     }
 
-    // Log readings
-    char msg[128];
-    snprintf(msg, sizeof(msg), "Readings: T=%.2f°C H=%.2f%% P=%.2f hPa G=%.2f kΩ", t, h, p, g);
+    // Read wind and rain with interrupt safety
+    noInterrupts();
+    unsigned long windTicks = windCount;
+    windCount = 0;
+    unsigned long rainTicks = rainCount;
+    rainCount = 0;
+    interrupts();
+
+    // Calculate wind speed in km/h
+    // SparkFun spec: 1.492 MPH = 1 pulse/sec = 2.4 km/h per pulse/sec
+    float intervalSeconds = SENSOR_INTERVAL_MS / 1000.0;
+    wind_kmh = (windTicks / intervalSeconds) * WIND_FACTOR;
+    
+    // Calculate rain in mm
+    // SparkFun spec: 0.011" per tip = 0.2794mm per tip
+    rain_mm = rainTicks * RAIN_PER_TIP;
+    
+    // Read wind direction
+    int windDirAnalog = analogRead(windDirPin);
+    WindDirData windData = getWindDirection(windDirAnalog);
+    wind_deg = windData.degrees;
+    wind_direction = String(windData.direction);
+
+    // Log all readings
+    char msg[256];
+snprintf(msg, sizeof(msg), 
+         "T=%.2fC H=%.2f%% P=%.2f hPa G=%.2f kOhm | Wind=%.2f km/h Dir=%s (%.1f deg) Rain=%.2f mm",
+         t, h, p, g, wind_kmh, wind_direction.c_str(), wind_deg, rain_mm);
     logMessage(msg);
 
-    // Upload to Adafruit IO
+    // Upload to cloud
     uploadToAdafruitIO();
 
-    // Periodic log pruning check
+    // Periodic maintenance
     if (sdCardAvailable) {
       pruneLog();
     }
   }
 
-  // Small delay to prevent tight looping
   delay(10);
 }
