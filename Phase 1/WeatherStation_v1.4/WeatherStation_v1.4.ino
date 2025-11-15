@@ -38,6 +38,10 @@
 // Gust calculation config
 #define WIND_GUST_WINDOW_MS 2000      // Gust window (2 seconds)
 
+// --- Wind direction calibration / deadzone (small, safe changes only) ---
+#define WIND_DIR_ROTATION_OFFSET 112.5f   // degrees to rotate averaged result so "north" aligns
+#define WIND_DIR_DEADZONE_DEG    5.0f     // degrees deadband to ignore small jitter
+
 // --- Adafruit IO ---
 AdafruitIO_WiFi io(IO_USERNAME, IO_KEY, WIFI_SSID, WIFI_PASS); // Place BEFORE feeds!
 
@@ -259,33 +263,54 @@ void updateWindDirBuffer() {
   }
 }
 
+// --- Averaging with rotation + deadzone (float-safe and wrap-aware) ---
 WindDirData getAveragedWindDirection() {
-  float sumX = 0, sumY = 0;
+  float sumX = 0.0f, sumY = 0.0f;
   for (int i = 0; i < WIND_DIR_BUFFER_SIZE; i++) {
     WindDirData wd = getWindDirectionFromADC(windDirBuffer[i]);
-    float radians = wd.degrees * PI / 180.0;
-    sumX += cos(radians);
-    sumY += sin(radians);
+    float radians = wd.degrees * PI / 180.0f;
+    sumX += cosf(radians);
+    sumY += sinf(radians);
   }
-  float avgRadians = atan2(sumY, sumX);
-  float avgDegrees = avgRadians * 180.0 / PI;
-  if (avgDegrees < 0) avgDegrees += 360.0;
 
-  if (avgDegrees < 11.25 || avgDegrees >= 348.75) return {avgDegrees, "N"};
-  if (avgDegrees < 33.75) return {avgDegrees, "NNE"};
-  if (avgDegrees < 56.25) return {avgDegrees, "NE"};
-  if (avgDegrees < 78.75) return {avgDegrees, "ENE"};
-  if (avgDegrees < 101.25) return {avgDegrees, "E"};
-  if (avgDegrees < 123.75) return {avgDegrees, "ESE"};
-  if (avgDegrees < 146.25) return {avgDegrees, "SE"};
-  if (avgDegrees < 168.75) return {avgDegrees, "SSE"};
-  if (avgDegrees < 191.25) return {avgDegrees, "S"};
-  if (avgDegrees < 213.75) return {avgDegrees, "SSW"};
-  if (avgDegrees < 236.25) return {avgDegrees, "SW"};
-  if (avgDegrees < 258.75) return {avgDegrees, "WSW"};
-  if (avgDegrees < 281.25) return {avgDegrees, "W"};
-  if (avgDegrees < 303.75) return {avgDegrees, "WNW"};
-  if (avgDegrees < 326.25) return {avgDegrees, "NW"};
+  float avgRadians = atan2f(sumY, sumX);
+  float avgDegrees = avgRadians * 180.0f / PI;
+  if (avgDegrees < 0.0f) avgDegrees += 360.0f;
+
+  // calibrate rotation so North is actually North
+  avgDegrees -= WIND_DIR_ROTATION_OFFSET;
+  if (avgDegrees < 0.0f) avgDegrees += 360.0f;
+  if (avgDegrees >= 360.0f) avgDegrees -= 360.0f;
+
+  // jitter deadband to ignore small fluctuations
+  static float lastReportedDeg = -1.0f;
+  if (lastReportedDeg < 0.0f) {
+    lastReportedDeg = avgDegrees; // initialize on first run
+  } else {
+    float diff = fabsf(avgDegrees - lastReportedDeg);
+    if (diff > 180.0f) diff = 360.0f - diff; // shortest arc
+    if (diff < WIND_DIR_DEADZONE_DEG) {
+      avgDegrees = lastReportedDeg; // keep previous value
+    } else {
+      lastReportedDeg = avgDegrees; // accept new reading
+    }
+  }
+
+  if (avgDegrees < 11.25f || avgDegrees >= 348.75f) return {avgDegrees, "N"};
+  if (avgDegrees < 33.75f) return {avgDegrees, "NNE"};
+  if (avgDegrees < 56.25f) return {avgDegrees, "NE"};
+  if (avgDegrees < 78.75f) return {avgDegrees, "ENE"};
+  if (avgDegrees < 101.25f) return {avgDegrees, "E"};
+  if (avgDegrees < 123.75f) return {avgDegrees, "ESE"};
+  if (avgDegrees < 146.25f) return {avgDegrees, "SE"};
+  if (avgDegrees < 168.75f) return {avgDegrees, "SSE"};
+  if (avgDegrees < 191.25f) return {avgDegrees, "S"};
+  if (avgDegrees < 213.75f) return {avgDegrees, "SSW"};
+  if (avgDegrees < 236.25f) return {avgDegrees, "SW"};
+  if (avgDegrees < 258.75f) return {avgDegrees, "WSW"};
+  if (avgDegrees < 281.25f) return {avgDegrees, "W"};
+  if (avgDegrees < 303.75f) return {avgDegrees, "WNW"};
+  if (avgDegrees < 326.25f) return {avgDegrees, "NW"};
   return {avgDegrees, "NNW"};
 }
 
