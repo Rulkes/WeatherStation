@@ -14,7 +14,7 @@
 
 // --- CONFIGURATION ---
 #define SEALEVELPRESSURE_HPA 1013.25
-#define SD_CS 5
+#define SD_CS 26
 #define LOG_FILE "/system.log"
 #define LOG_MAX_LINES 5000
 #define SENSOR_INTERVAL_MS 30000       // 30 seconds
@@ -23,8 +23,8 @@
 #define SENSOR_WARMUP_READINGS 5
 
 // Lightning Detector Pins
-#define AS3935_CS 15
-#define AS3935_INT 19
+#define AS3935_CS 5
+#define AS3935_INT 27
 
 // SparkFun Weather Meter Kit specifications
 #define WIND_FACTOR 2.4
@@ -38,12 +38,12 @@
 // Gust calculation config
 #define WIND_GUST_WINDOW_MS 2000      // Gust window (2 seconds)
 
-// --- Wind direction calibration / deadzone (small, safe changes only) ---
-#define WIND_DIR_ROTATION_OFFSET 112.5f   // degrees to rotate averaged result so "north" aligns
-#define WIND_DIR_DEADZONE_DEG    5.0f     // degrees deadband to ignore small jitter
+// --- Wind direction calibration / deadzone ---
+#define WIND_DIR_ROTATION_OFFSET 112.5f
+#define WIND_DIR_DEADZONE_DEG    5.0f
 
 // --- Adafruit IO ---
-AdafruitIO_WiFi io(IO_USERNAME, IO_KEY, WIFI_SSID, WIFI_PASS); // Place BEFORE feeds!
+AdafruitIO_WiFi io(IO_USERNAME, IO_KEY, WIFI_SSID, WIFI_PASS);
 
 Adafruit_BME680 bme;
 SparkFun_AS3935 lightning;
@@ -58,7 +58,7 @@ AdafruitIO_Feed *rainGauge     = io.feed("RainGauge");
 AdafruitIO_Feed *windDir       = io.feed("WindDirection");
 AdafruitIO_Feed *windDirText   = io.feed("WindDirectionText");
 AdafruitIO_Feed *lightningFeed = io.feed("Lightning");
-AdafruitIO_Feed *windGust      = io.feed("WindGust"); // Gust feed
+AdafruitIO_Feed *windGust      = io.feed("WindGust");
 
 // --- Wind direction struct ---
 struct WindDirData {
@@ -80,7 +80,7 @@ String wind_direction = "N";
 
 // Wind/rain hardware pins
 const int windPin = 4;
-const int rainPin = 27;
+const int rainPin = 13;
 const int windDirPin = 34;
 
 // --- Interrupt variables ---
@@ -88,6 +88,10 @@ volatile unsigned long windCount = 0;
 volatile unsigned long rainCount = 0;
 volatile unsigned long lastWindTime = 0;
 volatile unsigned long lastRainTime = 0;
+
+// --- 24h rain tracking ---
+volatile unsigned long rainCount24h = 0;
+time_t lastRainReset = 0;
 
 // --- Wind Gust State ---
 unsigned long gustWindowStart = 0;
@@ -103,7 +107,7 @@ void IRAM_ATTR onWind() {
   unsigned long now = millis();
   if (now - lastWindTime > DEBOUNCE_MS) {
     windCount++;
-    gustWindowCount++; // For gust calculation
+    gustWindowCount++;
     lastWindTime = now;
   }
 }
@@ -112,6 +116,7 @@ void IRAM_ATTR onRain() {
   unsigned long now = millis();
   if (now - lastRainTime > DEBOUNCE_MS) {
     rainCount++;
+    rainCount24h++;
     lastRainTime = now;
   }
 }
@@ -263,7 +268,7 @@ void updateWindDirBuffer() {
   }
 }
 
-// --- Averaging with rotation + deadzone (float-safe and wrap-aware) ---
+// --- Averaging with rotation + deadzone ---
 WindDirData getAveragedWindDirection() {
   float sumX = 0.0f, sumY = 0.0f;
   for (int i = 0; i < WIND_DIR_BUFFER_SIZE; i++) {
@@ -277,23 +282,17 @@ WindDirData getAveragedWindDirection() {
   float avgDegrees = avgRadians * 180.0f / PI;
   if (avgDegrees < 0.0f) avgDegrees += 360.0f;
 
-  // calibrate rotation so North is actually North
   avgDegrees -= WIND_DIR_ROTATION_OFFSET;
   if (avgDegrees < 0.0f) avgDegrees += 360.0f;
   if (avgDegrees >= 360.0f) avgDegrees -= 360.0f;
 
-  // jitter deadband to ignore small fluctuations
   static float lastReportedDeg = -1.0f;
-  if (lastReportedDeg < 0.0f) {
-    lastReportedDeg = avgDegrees; // initialize on first run
-  } else {
+  if (lastReportedDeg < 0.0f) lastReportedDeg = avgDegrees;
+  else {
     float diff = fabsf(avgDegrees - lastReportedDeg);
-    if (diff > 180.0f) diff = 360.0f - diff; // shortest arc
-    if (diff < WIND_DIR_DEADZONE_DEG) {
-      avgDegrees = lastReportedDeg; // keep previous value
-    } else {
-      lastReportedDeg = avgDegrees; // accept new reading
-    }
+    if (diff > 180.0f) diff = 360.0f - diff;
+    if (diff < WIND_DIR_DEADZONE_DEG) avgDegrees = lastReportedDeg;
+    else lastReportedDeg = avgDegrees;
   }
 
   if (avgDegrees < 11.25f || avgDegrees >= 348.75f) return {avgDegrees, "N"};
@@ -324,7 +323,6 @@ void updateWindGust() {
     gustWindowCount = 0;
     gustWindowStart = now;
     interrupts();
-    // For this window, get the speed
     float windowKmh = (count / (WIND_GUST_WINDOW_MS / 1000.0)) * WIND_FACTOR;
     if (windowKmh > gust_kmh) gust_kmh = windowKmh;
   }
@@ -372,7 +370,7 @@ void logIPAddress() {
 // --- Lightning Event Handler ---
 void handleLightningEvents() {
   if (lightningAvailable && digitalRead(AS3935_INT) == HIGH) {
-    delay(2); // Debounce
+    delay(2);
     byte event = lightning.readInterruptReg();
 
     if (event == 1) {
@@ -403,7 +401,6 @@ void readAndUploadSensors() {
     }
   }
 
-  // Read BME680
   if (!bme.performReading()) {
     logMessage("BME680 read failed - will retry");
     sensorAvailable = false;
@@ -422,13 +419,23 @@ void readAndUploadSensors() {
     return;
   }
 
-  // Gas sensor warmup period
   if (gasWarmupCounter < SENSOR_WARMUP_READINGS) {
     gasWarmupCounter++;
     char msg[64];
     snprintf(msg, sizeof(msg), "Gas sensor warmup %d/%d", gasWarmupCounter, SENSOR_WARMUP_READINGS);
     logMessage(msg);
     return;
+  }
+
+  // --- Reset 24h rain at midnight ---
+  time_t nowTime;
+  time(&nowTime);
+  if (lastRainReset == 0) lastRainReset = nowTime;
+  struct tm *tmNow = localtime(&nowTime);
+  struct tm *tmLastReset = localtime(&lastRainReset);
+  if (tmNow->tm_mday != tmLastReset->tm_mday) {
+    rainCount24h = 0;
+    lastRainReset = nowTime;
   }
 
   // Wind, rain
@@ -440,9 +447,9 @@ void readAndUploadSensors() {
   interrupts();
   float intervalSeconds = SENSOR_INTERVAL_MS / 1000.0;
   wind_kmh = (windTicks / intervalSeconds) * WIND_FACTOR;
-  rain_mm = rainTicks * RAIN_PER_TIP;
+  float intervalRainMm = rainTicks * RAIN_PER_TIP;
+  rain_mm = rainCount24h * RAIN_PER_TIP;
 
-  // Non-blocking wind direction averaging
   if (windDirBufferReady) {
     WindDirData wd = getAveragedWindDirection();
     wind_deg = wd.degrees;
@@ -450,108 +457,65 @@ void readAndUploadSensors() {
     windDirBufferReady = false;
   }
 
-  // --- Gust value is accumulated by updateWindGust() and reset below ---
-
-  // Log all readings
   char msg[256];
   snprintf(msg, sizeof(msg),
-    "T=%.2f°C H=%.2f%% P=%.2f hPa G=%.2f kΩ | Wind=%.2f km/h Gust=%.2f km/h %.1f° (%s) Rain=%.2f mm",
-    t, h, p, g, wind_kmh, gust_kmh, wind_deg, wind_direction.c_str(), rain_mm);
+    "T=%.2f°C H=%.2f%% P=%.2fhPa G=%.2f kohms Wind=%.2f km/h Dir=%s Rain24h=%.2f mm Gust=%.2f km/h",
+    t, h, p, g, wind_kmh, wind_direction.c_str(), rain_mm, gust_kmh);
   logMessage(msg);
 
   uploadToAdafruitIO();
 
-  gust_kmh = 0; // Reset gust for next interval
-
-  if (sdCardAvailable) pruneLog();
+  gust_kmh = 0;
 }
 
 // --- Setup ---
 void setup() {
   Serial.begin(115200);
-  delay(100);
-  Serial.println("\n=== Weather Station with Lightning Detector ===");
-  logMessage("BUILD VERSION: " BUILD_VERSION);
+  delay(1000);
+  logMessage("System booting...");
 
-  // SD Card
-  Serial.println("Initializing SD card...");
-  delay(100);
-  if (SD.begin(SD_CS)) {
-    sdCardAvailable = true;
-    delay(50);
-    logMessage("SD card initialized");
-  } else {
-    Serial.println("SD card failed - continuing without logging");
-  }
-
-  // Adafruit IO
-  io.connect();
-  Serial.print("Connecting to Adafruit IO");
-  int connectAttempts = 0;
-  while (io.status() < AIO_CONNECTED && connectAttempts < 30) {
-    Serial.print(".");
+  WiFi.begin(WIFI_SSID, WIFI_PASS);
+  logMessage("Connecting to WiFi...");
+  int retries = 0;
+  while (WiFi.status() != WL_CONNECTED && retries < 20) {
     delay(500);
-    connectAttempts++;
+    Serial.print(".");
+    retries++;
   }
-  if (io.status() >= AIO_CONNECTED) {
-    Serial.println("\nConnected to Adafruit IO!");
-    logMessage("Connected to Adafruit IO");
-    logIPAddress();
-    configTime(0, 0, "pool.ntp.org", "time.nist.gov");
-    logMessage("NTP time sync configured");
+  Serial.println();
+  logIPAddress();
+
+  if (!SD.begin(SD_CS)) {
+    sdCardAvailable = false;
+    logMessage("SD card not detected");
   } else {
-    Serial.println("\nFailed to connect");
-    logMessage("Initial connection failed");
+    sdCardAvailable = true;
+    logMessage("SD card initialized");
   }
 
-  // BME680
-  sensorAvailable = initSensor();
+  initSensor();
 
-  // Wind and Rain
   pinMode(windPin, INPUT_PULLUP);
-  attachInterrupt(digitalPinToInterrupt(windPin), onWind, FALLING);
+  attachInterrupt(digitalPinToInterrupt(windPin), onWind, RISING);
+
   pinMode(rainPin, INPUT_PULLUP);
-  attachInterrupt(digitalPinToInterrupt(rainPin), onRain, FALLING);
-  pinMode(windDirPin, INPUT);
-  logMessage("Wind and rain sensors initialized");
+  attachInterrupt(digitalPinToInterrupt(rainPin), onRain, RISING);
 
-  // Lightning Detector
-  SPI.begin();
-  if (!lightning.beginSPI(AS3935_CS, AS3935_INT)) {
-    logMessage("Lightning sensor not found - check wiring");
-    lightningAvailable = false;
-  } else {
-    lightning.calibrateOsc();
-    lightning.setNoiseLevel(2);
-    lightning.spikeRejection(2);
-    pinMode(AS3935_INT, INPUT);
-    lightningAvailable = true;
-    logMessage("Lightning detector initialized and monitoring");
-  }
+  io.connect();
 
-  if (sdCardAvailable) pruneLog();
-  logMessage("=== System startup complete ===");
-
-  // Fill wind direction buffer to start
-  for (int i = 0; i < WIND_DIR_BUFFER_SIZE; i++) {
-    windDirBuffer[i] = analogRead(windDirPin);
-    delay(20);
-  }
-  windDirBufferReady = true;
-  gustWindowStart = millis();
+  logMessage("Setup complete");
 }
 
-// --- Main Loop ---
+// --- Main loop ---
 void loop() {
   io.run();
   updateWindDirBuffer();
   updateWindGust();
   handleLightningEvents();
 
-  unsigned long now = millis();
-  if (now - lastSensorTime >= SENSOR_INTERVAL_MS) {
-    lastSensorTime = now;
+  if (millis() - lastSensorTime >= SENSOR_INTERVAL_MS) {
+    lastSensorTime = millis();
     readAndUploadSensors();
+    pruneLog();
   }
-  delay(10);
 }
