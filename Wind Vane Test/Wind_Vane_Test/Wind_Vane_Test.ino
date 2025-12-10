@@ -1,52 +1,65 @@
-// Wind vane test sketch for ESP32
-int windPin = 34; // ADC pin connected to yellow wire
+// ESP32 Wind Vane 8-Point Direction Test
+// Reads ADC on GPIO 32 and maps to 8 compass points using nearest-neighbor
 
-struct WindDir {
-  int adcMin;
-  int adcMax;
-  const char* direction;
-};
+const int windDirPin = 32; // ADC input
 
-// Example lookup table — adjust adcMin/adcMax after testing
-WindDir windMap[] = {
-  {0, 200, "N"},
-  {201, 400, "NNE"},
-  {401, 600, "NE"},
-  {601, 800, "ENE"},
-  {801, 1000, "E"},
-  {1001, 1200, "ESE"},
-  {1201, 1400, "SE"},
-  {1401, 1600, "SSE"},
-  {1601, 1800, "S"},
-  {1801, 2000, "SSW"},
-  {2001, 2200, "SW"},
-  {2201, 2400, "WSW"},
-  {2401, 2600, "W"},
-  {2601, 2800, "WNW"},
-  {2801, 3000, "NW"},
-  {3001, 4095, "NNW"}
-};
+// Updated calibrated ADC values from your latest test
+const char* directions[8] = {"N","NE","E","SE","S","SW","W","NW"};
+const int adcValues[8]   = {3022, 1700, 216, 586, 995, 2381, 3800, 3500};
 
-void setup() {
-  Serial.begin(115200);
+// Store last valid ADC reading
+int lastValidADC = adcValues[0];
+
+// Read ADC with averaging, ignoring near-zero spikes
+int readWindDir() {
+  long sum = 0;
+  int validSamples = 0;
+  const int samples = 5;
+
+  for(int i=0;i<samples;i++){
+    int val = analogRead(windDirPin);
+    if(val>10){  // ignore 0 / floating spikes
+      sum += val;
+      validSamples++;
+    }
+    delay(10);
+  }
+
+  if(validSamples == 0) return lastValidADC; // keep last reading if none valid
+  lastValidADC = sum / validSamples;
+  return lastValidADC;
 }
 
-void loop() {
-  int adcVal = analogRead(windPin);
+// Map ADC reading to nearest compass direction
+String getDirection(int adc) {
+  int closestIndex = 0;
+  int smallestDiff = abs(adc - adcValues[0]);
 
-  const char* direction = "Unknown";
-
-  for (int i = 0; i < 16; i++) {
-    if (adcVal >= windMap[i].adcMin && adcVal <= windMap[i].adcMax) {
-      direction = windMap[i].direction;
-      break;
+  for(int i=1;i<8;i++){
+    int diff = abs(adc - adcValues[i]);
+    if(diff < smallestDiff){
+      smallestDiff = diff;
+      closestIndex = i;
     }
   }
 
-  Serial.print("ADC: ");
-  Serial.print(adcVal);
-  Serial.print(" | Direction: ");
-  Serial.println(direction);
+  return String(directions[closestIndex]);
+}
 
-  delay(500); // Read twice per second
+void setup() {
+  Serial.begin(115200);
+  delay(1000);
+  Serial.println("Wind vane direction test starting...");
+}
+
+void loop() {
+  int rawADC = readWindDir();
+  String dir = getDirection(rawADC);
+
+  Serial.print("Raw ADC: ");
+  Serial.print(rawADC);
+  Serial.print(" → Direction: ");
+  Serial.println(dir);
+
+  delay(500);
 }
